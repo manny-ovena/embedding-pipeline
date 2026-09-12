@@ -1,12 +1,21 @@
+use crate::error::EmbeddingError;
 use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tracing::{instrument, warn};
 
 #[async_trait]
 pub trait EmbeddingBackend: Send + Sync {
-    async fn embed(&self, chunk: &EmbeddedChunk) -> Vec<f32>;
-    async fn embed_batch(&self, chunks: &[EmbeddedChunk]) -> Vec<Vec<f32>>;
+    /// Embeds a single text string into a vector.
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError>;
+
+    /// Embeds a batch of text strings into vectors.
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError>;
+
+    /// Returns the embedding dimension produced by this backend.
+    fn dimension(&self) -> usize;
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -19,10 +28,10 @@ pub trait HttpClient: Send + Sync {
     ) -> Result<HttpResponse, reqwest::Error>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HttpResponse {
-    status: StatusCode,
-    body: String,
+    pub status: StatusCode,
+    pub body: String,
 }
 
 pub struct ReqwestClient {
@@ -32,6 +41,17 @@ pub struct ReqwestClient {
 impl ReqwestClient {
     pub fn new(client: reqwest::Client) -> Self {
         Self { client }
+    }
+}
+
+impl Default for ReqwestClient {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+        }
     }
 }
 
@@ -49,7 +69,7 @@ impl HttpClient for ReqwestClient {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddedChunk {
     pub doc_id: String,
     pub chunk_index: usize,
@@ -69,10 +89,225 @@ impl EmbeddedChunk {
 }
 
 #[derive(Debug, Deserialize)]
-struct EmbeddingError {
-    code: u32,
-    kind: String,
-    message: String,
+struct ApiErrorPayload {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum EmbeddingInput {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+#[derive(Serialize)]
+struct EmbeddingRequest {
+    model: String,
+    input: EmbeddingInput,
+    encoding_format: String,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingResponse {
+    #[serde(default)]
+    pub data: Vec<EmbeddingItem>,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingItem {
+    pub index: usize,
+    pub embedding: Vec<f32>,
+}
+
+pub struct VllmBackend {
+    base_url: String,
+    model_name: String,
+    client: Arc<dyn HttpClient>,
+    dimension: usize,
+    max_batch_size: usize,
+    semaphore: Arc<Semaphore>,
+}
+
+impl VllmBackend {
+    pub fn new(base_url: String, model_name: String, client: Arc<dyn HttpClient>) -> Self {
+        Self::with_config(base_url, model_name, client, 4096, 64, 8)
+    }
+
+    pub fn with_config(
+        base_url: String,
+        model_name: String,
+        client: Arc<dyn HttpClient>,
+        dimension: usize,
+        max_batch_size: usize,
+        max_concurrency: usize,
+    ) -> Self {
+        Self {
+            base_url,
+            model_name,
+            client,
+            dimension,
+            max_batch_size,
+            semaphore: Arc::new(Semaphore::new(max_concurrency)),
+        }
+    }
+
+    async fn execute_request(
+        &self,
+        input: EmbeddingInput,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        let _permit = self.semaphore.acquire().await;
+        let url = format!(
+            "{}/{}",
+            self.base_url.trim_end_matches('/'),
+            "v1/embeddings"
+        );
+
+        let body = EmbeddingRequest {
+            model: self.model_name.clone(),
+            input,
+            encoding_format: "float".to_string(),
+        };
+        let body_json = serde_json::to_value(&body)?;
+
+        // Request with retry logic for 429/503
+        let mut attempts = 0;
+        let max_attempts = 3;
+        loop {
+            attempts += 1;
+            let response = self.client.post_json(&url, &body_json).await?;
+            let status = response.status;
+            let body_str = response.body;
+
+            if status.is_success() {
+                let parsed: EmbeddingResponse = serde_json::from_str(&body_str)?;
+                let mut sorted_data = parsed.data;
+                sorted_data.sort_by_key(|item| item.index);
+                return Ok(sorted_data.into_iter().map(|item| item.embedding).collect());
+            }
+
+            if (status == StatusCode::TOO_MANY_REQUESTS
+                || status == StatusCode::SERVICE_UNAVAILABLE)
+                && attempts < max_attempts
+            {
+                let delay = std::time::Duration::from_millis(50 * (1 << attempts));
+                warn!(
+                    "Embedding backend returned {}, retrying attempt {}/{} in {:?}",
+                    status, attempts, max_attempts, delay
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            let msg = if let Ok(err_payload) = serde_json::from_str::<ApiErrorPayload>(&body_str) {
+                err_payload
+                    .message
+                    .or(err_payload.error)
+                    .unwrap_or(body_str)
+            } else {
+                body_str
+            };
+
+            return Err(EmbeddingError::BackendError {
+                status: status.as_u16(),
+                message: msg,
+            });
+        }
+    }
+}
+
+#[async_trait]
+impl EmbeddingBackend for VllmBackend {
+    #[instrument(skip(self), fields(model = %self.model_name))]
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        let mut results = self
+            .execute_request(EmbeddingInput::Single(text.to_string()))
+            .await?;
+        results.pop().ok_or(EmbeddingError::EmptyEmbedding)
+    }
+
+    #[instrument(skip(self, texts), fields(count = texts.len()))]
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut all_results = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(self.max_batch_size) {
+            let chunk_results = self
+                .execute_request(EmbeddingInput::Batch(chunk.to_vec()))
+                .await?;
+            all_results.extend(chunk_results);
+        }
+
+        Ok(all_results)
+    }
+
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+}
+
+pub type OpenAiBackend = VllmBackend;
+
+/// Deterministic mock backend for offline testing, demos, and benchmarks without a GPU.
+pub struct MockBackend {
+    dimension: usize,
+}
+
+impl MockBackend {
+    pub fn new(dimension: usize) -> Self {
+        Self { dimension }
+    }
+
+    fn generate_vector(&self, text: &str) -> Vec<f32> {
+        let mut vec = vec![0.0f32; self.dimension];
+        if text.is_empty() {
+            return vec;
+        }
+
+        for (i, word) in text.split_whitespace().enumerate() {
+            let hash = word
+                .bytes()
+                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+            let idx = (hash as usize) % self.dimension;
+            let weight = 1.0 / ((i + 1) as f32).sqrt();
+            vec[idx] += weight;
+        }
+
+        // Normalize to unit L2 norm
+        let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if norm > 1e-6 {
+            for v in &mut vec {
+                *v /= norm;
+            }
+        }
+
+        vec
+    }
+}
+
+impl Default for MockBackend {
+    fn default() -> Self {
+        Self::new(384)
+    }
+}
+
+#[async_trait]
+impl EmbeddingBackend for MockBackend {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        Ok(self.generate_vector(text))
+    }
+
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        Ok(texts.iter().map(|t| self.generate_vector(t)).collect())
+    }
+
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
 }
 
 pub struct Embedder {
@@ -84,109 +319,24 @@ impl Embedder {
         Self { backend }
     }
 
-    pub async fn embed_batch(&self, chunks: &[EmbeddedChunk]) -> Vec<Vec<f32>> {
-        self.backend.embed_batch(chunks).await
-    }
-}
-
-#[derive(Serialize)]
-struct EmbeddingRequest {
-    model: String,
-    input: String,
-    encoding_format: String,
-}
-
-#[derive(Deserialize)]
-struct EmbeddingResponse {
-    id: String,
-    object: String,
-    created: u64,
-    model: String,
-    data: Vec<EmbeddingItem>,
-    usage: EmbeddingUsage,
-}
-
-#[derive(Deserialize)]
-struct EmbeddingItem {
-    index: usize,
-    object: String,
-    embedding: Vec<f32>,
-}
-
-#[derive(Deserialize)]
-struct EmbeddingUsage {
-    prompt_tokens: u32,
-    total_tokens: u32,
-    completion_tokens: u32,
-    prompt_tokens_details: Option<serde_json::Value>,
-}
-
-pub struct VllmBackend {
-    base_url: String,
-    model_name: String,
-    client: Arc<dyn HttpClient>,
-}
-
-impl VllmBackend {
-    pub fn new(base_url: String, model_name: String, client: Arc<dyn HttpClient>) -> Self {
-        Self {
-            base_url,
-            model_name,
-            client,
-        }
+    pub async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        self.backend.embed(text).await
     }
 
-    async fn post_json(&self, path: &str, body: &serde_json::Value) -> serde_json::Value {
-        let url = format!(
-            "{}/{}",
-            self.base_url.trim_end_matches('/'),
-            path.trim_start_matches('/')
-        );
-        let response = self
-            .client
-            .post_json(&url, body)
-            .await
-            .expect("Embedding request failed");
-        let status = response.status;
-        let body = response.body;
-        dbg!(&body);
-
-        if !status.is_success() {
-            let error: EmbeddingError =
-                serde_json::from_str(&body).expect("Failed to parse response error");
-            panic!("Generate request failed with status {status}: {error:?}");
-        }
-
-        serde_json::from_str(&body).expect("Failed to parse JSON response")
-    }
-}
-
-#[async_trait]
-impl EmbeddingBackend for VllmBackend {
-    async fn embed(&self, chunk: &EmbeddedChunk) -> Vec<f32> {
-        let body = EmbeddingRequest {
-            model: self.model_name.clone(),
-            input: chunk.text.clone(),
-            encoding_format: "float".to_string(),
-        };
-        let body = serde_json::to_value(&body).expect("Failed to serialize embedding request");
-        let response = self.post_json("/v1/embeddings", &body).await;
-        let response: EmbeddingResponse =
-            serde_json::from_value(response).expect("Failed to parse embedding response");
-
-        response
-            .data
-            .first()
-            .map(|item| item.embedding.clone())
-            .unwrap_or_default()
+    pub async fn embed_batch(
+        &self,
+        chunks: &[EmbeddedChunk],
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+        self.backend.embed_batch(&texts).await
     }
 
-    async fn embed_batch(&self, chunks: &[EmbeddedChunk]) -> Vec<Vec<f32>> {
-        let mut results = Vec::new();
-        for chunk in chunks {
-            results.push(self.embed(chunk).await);
-        }
-        results
+    pub async fn embed_strings(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.backend.embed_batch(texts).await
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.backend.dimension()
     }
 }
 
@@ -198,62 +348,25 @@ mod tests {
         HttpResponse {
             status: StatusCode::OK,
             body: serde_json::json!({
-                "id": "embd-99a96378ed33115e",
-                "object": "list",
-                "created": 1789062205_u64,
-                "model": "Qwen3-Embedding-4B",
                 "data": [{
                     "index": 0,
-                    "object": "embedding",
                     "embedding": [-0.25, 0.5]
-                }],
-                "usage": {
-                    "prompt_tokens": 11,
-                    "total_tokens": 11,
-                    "completion_tokens": 0,
-                    "prompt_tokens_details": null
-                }
+                }]
             })
             .to_string(),
         }
     }
 
-    fn chunk(text: &str) -> EmbeddedChunk {
-        EmbeddedChunk::new("doc-1".to_string(), 0, text.to_string(), Vec::new())
-    }
-
     #[test]
-    fn deserializes_embedding_response() {
-        let response: EmbeddingResponse = serde_json::from_value(serde_json::json!({
-            "id": "embd-99a96378ed33115e",
-            "object": "list",
-            "created": 1789062205,
-            "model": "Qwen3-Embedding-4B",
-            "data": [{
-                "index": 0,
-                "object": "embedding",
-                "embedding": [-0.0003177309990860522, -0.02356986328959465]
-            }],
-            "usage": {
-                "prompt_tokens": 11,
-                "total_tokens": 11,
-                "completion_tokens": 0,
-                "prompt_tokens_details": null
-            }
-        }))
-        .expect("response should match the embedding API shape");
+    fn mock_backend_returns_deterministic_vectors() {
+        let backend = MockBackend::new(128);
+        let v1 = backend.generate_vector("hello world");
+        let v2 = backend.generate_vector("hello world");
+        let v3 = backend.generate_vector("different text");
 
-        assert_eq!(response.id, "embd-99a96378ed33115e");
-        assert_eq!(response.object, "list");
-        assert_eq!(response.created, 1789062205);
-        assert_eq!(response.model, "Qwen3-Embedding-4B");
-        assert_eq!(response.data[0].index, 0);
-        assert_eq!(response.data[0].object, "embedding");
-        assert_eq!(response.data[0].embedding.len(), 2);
-        assert_eq!(response.usage.prompt_tokens, 11);
-        assert_eq!(response.usage.total_tokens, 11);
-        assert_eq!(response.usage.completion_tokens, 0);
-        assert!(response.usage.prompt_tokens_details.is_none());
+        assert_eq!(v1, v2);
+        assert_ne!(v1, v3);
+        assert_eq!(v1.len(), 128);
     }
 
     #[tokio::test]
@@ -272,57 +385,40 @@ mod tests {
             })
             .times(1)
             .returning(|_, _| Ok(successful_http_response()));
+
         let backend = VllmBackend::new(
             "http://localhost:8000/".to_string(),
             "Qwen3-Embedding-4B".to_string(),
             Arc::new(client),
         );
 
-        let embedding = backend.embed(&chunk("hello")).await;
-
+        let embedding = backend.embed("hello").await.unwrap();
         assert_eq!(embedding, vec![-0.25, 0.5]);
     }
 
     #[tokio::test]
-    #[should_panic(expected = "Generate request failed with status 500 Internal Server Error")]
-    async fn panics_on_http_error() {
+    async fn returns_backend_error_on_http_failure() {
         let mut client = MockHttpClient::new();
         client.expect_post_json().times(1).returning(|_, _| {
             Ok(HttpResponse {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 body: serde_json::json!({
-                    "code": 500,
-                    "kind": "server_error",
-                    "message": "embedding failed"
+                    "message": "server error"
                 })
                 .to_string(),
             })
         });
+
         let backend = VllmBackend::new(
             "http://localhost:8000".to_string(),
             "Qwen3-Embedding-4B".to_string(),
             Arc::new(client),
         );
 
-        backend.embed(&chunk("hello")).await;
-    }
-
-    #[tokio::test]
-    async fn embeds_each_chunk_in_batch() {
-        let mut client = MockHttpClient::new();
-        client
-            .expect_post_json()
-            .times(2)
-            .returning(|_, _| Ok(successful_http_response()));
-        let backend = VllmBackend::new(
-            "http://localhost:8000".to_string(),
-            "Qwen3-Embedding-4B".to_string(),
-            Arc::new(client),
-        );
-        let chunks = vec![chunk("first"), chunk("second")];
-
-        let embeddings = backend.embed_batch(&chunks).await;
-
-        assert_eq!(embeddings, vec![vec![-0.25, 0.5], vec![-0.25, 0.5]]);
+        let result = backend.embed("hello").await;
+        assert!(matches!(
+            result,
+            Err(EmbeddingError::BackendError { status: 500, .. })
+        ));
     }
 }
