@@ -1,10 +1,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use embedding_pipeline::testing::{InMemoryVectorStore, MockBackend};
 use embedding_pipeline::{
     ChunkConfig, Chunker, ChunkingStrategy, DistanceMetric, Embedder, EmbeddingBackend,
-    EmbeddingPipeline, FastTokenizer, InMemoryVectorStore, MockBackend, ReqwestClient,
-    SimpleTokenizer, Tokenizer, VllmBackend,
+    EmbeddingPipeline, FastTokenizer, ReqwestClient, SimpleTokenizer, Tokenizer, VectorStore,
+    VllmBackend,
 };
 
 const MODEL_TOKENIZER_PATH: &str = "/srv/ai-models/Qwen/Qwen3-Embedding-4B/tokenizer.json";
@@ -91,7 +92,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query = "high performance async runtime";
     println!("\nRunning semantic search query: \"{}\"", query);
     let query_vector = pipeline.embedder().embed(query).await?;
-    let search_results = vector_store.search(&query_vector, 2, DistanceMetric::Cosine)?;
+    let search_results = vector_store
+        .search(&query_vector, 2, DistanceMetric::Cosine)
+        .await?;
 
     println!("\nTop Search Results:");
     for (rank, result) in search_results.iter().enumerate() {

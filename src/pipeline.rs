@@ -8,7 +8,7 @@ use crate::{
     error::PipelineError,
     normalize::{NormalizationOptions, normalize_text_with_options},
     tokenizer::Tokenizer,
-    vector_store::InMemoryVectorStore,
+    vector_store::VectorStore,
 };
 
 pub struct EmbeddingPipeline {
@@ -89,15 +89,15 @@ impl EmbeddingPipeline {
         Ok(all_chunks)
     }
 
-    /// Ingests documents directly into an in-memory vector store.
-    pub async fn index_documents(
+    /// Ingests documents directly into a vector store.
+    pub async fn index_documents<S: VectorStore + ?Sized>(
         &self,
         docs: Vec<(String, String)>,
-        store: &mut InMemoryVectorStore,
+        store: &mut S,
     ) -> Result<usize, PipelineError> {
         let chunks = self.run_on_documents(docs, 4).await?;
         let count = chunks.len();
-        store.insert_batch(chunks);
+        store.insert_batch(chunks).await?;
         Ok(count)
     }
 }
@@ -148,5 +148,58 @@ impl PipelineBuilder {
             embedder,
             norm_options: self.norm_options,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::MockBackend;
+    use crate::tokenizer::SimpleTokenizer;
+    use crate::vector_store::{DistanceMetric, SearchResult};
+    use async_trait::async_trait;
+
+    #[derive(Default)]
+    struct RecordingVectorStore {
+        received_chunks: Vec<EmbeddedChunk>,
+    }
+
+    #[async_trait]
+    impl VectorStore for RecordingVectorStore {
+        async fn insert(&mut self, chunk: EmbeddedChunk) -> Result<(), PipelineError> {
+            self.received_chunks.push(chunk);
+            Ok(())
+        }
+
+        async fn search(
+            &self,
+            _query: &[f32],
+            _top_k: usize,
+            _metric: DistanceMetric,
+        ) -> Result<Vec<SearchResult>, PipelineError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_index_documents_with_custom_store() {
+        let tokenizer = Arc::new(SimpleTokenizer::new());
+        let backend = Arc::new(MockBackend::new(128));
+        let chunk_config = ChunkConfig::new(64, 16).unwrap();
+        let chunker = Chunker::new(chunk_config, tokenizer.clone());
+        let embedder = Embedder::new(backend);
+        let pipeline = EmbeddingPipeline::new(tokenizer, chunker, embedder);
+
+        let docs = vec![
+            ("doc1".to_string(), "This is test document one.".to_string()),
+            ("doc2".to_string(), "This is test document two.".to_string()),
+        ];
+
+        let mut custom = RecordingVectorStore::default();
+        let count = pipeline.index_documents(docs, &mut custom).await.unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(custom.received_chunks.len(), 2);
+        assert_eq!(custom.received_chunks[0].doc_id, "doc1");
+        assert_eq!(custom.received_chunks[1].doc_id, "doc2");
     }
 }

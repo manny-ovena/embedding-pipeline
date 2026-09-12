@@ -252,64 +252,6 @@ impl EmbeddingBackend for VllmBackend {
 
 pub type OpenAiBackend = VllmBackend;
 
-/// Deterministic mock backend for offline testing, demos, and benchmarks without a GPU.
-pub struct MockBackend {
-    dimension: usize,
-}
-
-impl MockBackend {
-    pub fn new(dimension: usize) -> Self {
-        Self { dimension }
-    }
-
-    fn generate_vector(&self, text: &str) -> Vec<f32> {
-        let mut vec = vec![0.0f32; self.dimension];
-        if text.is_empty() {
-            return vec;
-        }
-
-        for (i, word) in text.split_whitespace().enumerate() {
-            let hash = word
-                .bytes()
-                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-            let idx = (hash as usize) % self.dimension;
-            let weight = 1.0 / ((i + 1) as f32).sqrt();
-            vec[idx] += weight;
-        }
-
-        // Normalize to unit L2 norm
-        let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
-        if norm > 1e-6 {
-            for v in &mut vec {
-                *v /= norm;
-            }
-        }
-
-        vec
-    }
-}
-
-impl Default for MockBackend {
-    fn default() -> Self {
-        Self::new(384)
-    }
-}
-
-#[async_trait]
-impl EmbeddingBackend for MockBackend {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
-        Ok(self.generate_vector(text))
-    }
-
-    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
-        Ok(texts.iter().map(|t| self.generate_vector(t)).collect())
-    }
-
-    fn dimension(&self) -> usize {
-        self.dimension
-    }
-}
-
 pub struct Embedder {
     backend: Arc<dyn EmbeddingBackend>,
 }
@@ -343,6 +285,7 @@ impl Embedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::MockBackend;
 
     fn successful_http_response() -> HttpResponse {
         HttpResponse {

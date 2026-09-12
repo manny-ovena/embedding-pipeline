@@ -88,14 +88,15 @@ cargo bench
 
 ```rust
 use std::sync::Arc;
+use embedding_pipeline::testing::MockBackend;
 use embedding_pipeline::{
     EmbeddingPipeline, ChunkConfig, ChunkingStrategy, Chunker,
-    Embedder, MockBackend, SimpleTokenizer, InMemoryVectorStore, DistanceMetric,
+    Embedder, SimpleTokenizer, VectorStore, DistanceMetric,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Initialize Tokenizer & Backend (Mock for offline or VllmBackend for GPU)
+    // 1. Initialize Tokenizer & Backend (MockBackend from test-utils for offline or VllmBackend for GPU)
     let tokenizer = Arc::new(SimpleTokenizer::new());
     let backend = Arc::new(MockBackend::new(384));
 
@@ -106,8 +107,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .backend(backend)
         .build()?;
 
-    // 3. Ingest Documents
-    let mut store = InMemoryVectorStore::new();
+    // 3. Ingest Documents into your VectorStore implementation
+    // (e.g. Qdrant, Milvus, pgvector, or an in-memory vector store)
+    let mut store = MyVectorStore::new();
     let docs = vec![
         ("doc-1".into(), "Rust delivers high-performance async concurrency without garbage collection.".into()),
         ("doc-2".into(), "Vector databases index embeddings for low-latency similarity search.".into()),
@@ -116,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Query & Search
     let query_vector = pipeline.embedder().embed("concurrency in Rust").await?;
-    let results = store.search(&query_vector, 1, DistanceMetric::Cosine)?;
+    let results = store.search(&query_vector, 1, DistanceMetric::Cosine).await?;
 
     println!("Top Result: {:?}", results.first().map(|r| &r.chunk.text));
     Ok(())

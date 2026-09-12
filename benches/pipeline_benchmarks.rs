@@ -1,7 +1,8 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use embedding_pipeline::testing::{InMemoryVectorStore, cosine_similarity, dot_product};
 use embedding_pipeline::{
-    ChunkConfig, Chunker, ChunkingStrategy, DistanceMetric, InMemoryVectorStore, SimpleTokenizer,
-    cosine_similarity, dot_product, normalize_text,
+    ChunkConfig, Chunker, ChunkingStrategy, DistanceMetric, SimpleTokenizer, VectorStore,
+    normalize_text,
 };
 use std::sync::Arc;
 
@@ -35,27 +36,35 @@ fn bench_chunking(c: &mut Criterion) {
 }
 
 fn bench_vector_search(c: &mut Criterion) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
     let mut store = InMemoryVectorStore::new();
 
-    for i in 0..1000 {
-        let chunk = embedding_pipeline::EmbeddedChunk::new(
-            format!("doc-{}", i),
-            0,
-            format!("Document content number {}", i),
-            (0..384).map(|x| (x as f32 + i as f32).sin()).collect(),
-        );
-        store.insert(chunk);
-    }
+    let chunks: Vec<_> = (0..1000)
+        .map(|i| {
+            embedding_pipeline::EmbeddedChunk::new(
+                format!("doc-{}", i),
+                0,
+                format!("Document content number {}", i),
+                (0..384).map(|x| (x as f32 + i as f32).sin()).collect(),
+            )
+        })
+        .collect();
+
+    runtime.block_on(async {
+        store.insert_batch(chunks).await.unwrap();
+    });
 
     let query: Vec<f32> = (0..384).map(|x| (x as f32).cos()).collect();
 
     c.bench_function("vector_store_search_1k_top10", |b| {
-        b.iter(|| {
-            store.search(
-                black_box(&query),
-                black_box(10),
-                black_box(DistanceMetric::Cosine),
-            )
+        b.to_async(&runtime).iter(|| async {
+            store
+                .search(
+                    black_box(&query),
+                    black_box(10),
+                    black_box(DistanceMetric::Cosine),
+                )
+                .await
         })
     });
 

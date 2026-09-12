@@ -1,8 +1,9 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use embedding_pipeline::testing::{InMemoryVectorStore, MockBackend};
 use embedding_pipeline::{
     ChunkConfig, Chunker, ChunkingStrategy, DistanceMetric, Embedder, EmbeddingBackend,
-    EmbeddingPipeline, FastTokenizer, InMemoryVectorStore, MockBackend, ReqwestClient,
-    SimpleTokenizer, Tokenizer, VllmBackend,
+    EmbeddingPipeline, FastTokenizer, ReqwestClient, SimpleTokenizer, Tokenizer, VectorStore,
+    VllmBackend,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -118,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for query in queries {
                 println!("🔍 Query: \"{}\"", query);
                 let q_vec = pipeline.embedder().embed(query).await?;
-                let results = store.search(&q_vec, 1, DistanceMetric::Cosine)?;
+                let results = store.search(&q_vec, 1, DistanceMetric::Cosine).await?;
                 if let Some(top) = results.first() {
                     println!(
                         "   ⭐ Top Match: [{}] (Cosine Similarity: {:.4})\n      Text: \"{}\"\n",

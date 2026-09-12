@@ -3,6 +3,10 @@ name = "embedding-pipeline"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+test-utils = []
+
 [dependencies]
 async-trait = "0.1.89"
 clap = { version = "4.5", features = ["derive"] }
@@ -24,9 +28,15 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 [[bench]]
 name = "pipeline_benchmarks"
 harness = false
+required-features = ["test-utils"]
 
 [[bin]]
 name = "embed-cli"
 path = "src/bin/embed_cli.rs"
+required-features = ["test-utils"]
+
+[[example]]
+name = "embedding_pipeline"
+required-features = ["test-utils"]
 
 
