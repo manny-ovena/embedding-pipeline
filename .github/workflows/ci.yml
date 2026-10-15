@@ -48,4 +48,4 @@ jobs:
         run: cargo test --doc
 
       - name: Build CLI Binary
-        run: cargo build --release --bin embed-cli
+        run: cargo build --release --bin embed-cli --features test-utils
